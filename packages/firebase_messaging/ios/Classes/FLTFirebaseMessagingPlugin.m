@@ -21,21 +21,36 @@ static FlutterError *getFlutterError(NSError *error) {
                              details:error.localizedDescription];
 }
 
-static NSObject<FlutterPluginRegistrar> *_registrar;
+
+static NSString* backgroundSetupCallbackHandle = @"background_setup_callback";
+static NSString* backgroundMessageCallbackHandle = @"background_message_callback";
+static FlutterPluginRegistrantCallback pluginRegistrantCallback = nil;
+
+typedef void (^FetchCompletionHandler)(UIBackgroundFetchResult result);
 
 @implementation FLTFirebaseMessagingPlugin {
   FlutterMethodChannel *_channel;
+  FlutterMethodChannel *_backgroundCallbackChannel;
   NSDictionary *_launchNotification;
   BOOL _resumingFromBackground;
+  NSUserDefaults *_userDefaults;
+  NSObject<FlutterPluginRegistrar> *_registrar;
+  NSMutableArray *_remoteMessageQueue;
+  FlutterEngine *_headlessRunner;
+  BOOL backgroundIsolateInitialized;
+  FetchCompletionHandler fetchCompletionHandler;
+}
+
++ (void)setPluginRegistrantCallback:(FlutterPluginRegistrantCallback)callback {
+    pluginRegistrantCallback = callback;
 }
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
-  _registrar = registrar;
   FlutterMethodChannel *channel =
       [FlutterMethodChannel methodChannelWithName:@"plugins.flutter.io/firebase_messaging"
                                   binaryMessenger:[registrar messenger]];
   FLTFirebaseMessagingPlugin *instance =
-      [[FLTFirebaseMessagingPlugin alloc] initWithChannel:channel];
+    [[FLTFirebaseMessagingPlugin alloc] initWithChannel:channel registrar:registrar];
   [registrar addApplicationDelegate:instance];
   [registrar addMethodCallDelegate:instance channel:channel];
 
@@ -45,18 +60,25 @@ static NSObject<FlutterPluginRegistrar> *_registrar;
   }
 }
 
-- (instancetype)initWithChannel:(FlutterMethodChannel *)channel {
+- (instancetype)initWithChannel:(FlutterMethodChannel *)channel registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   self = [super init];
 
   if (self) {
     _channel = channel;
     _resumingFromBackground = NO;
+
     if (![FIRApp appNamed:@"__FIRAPP_DEFAULT"]) {
       NSLog(@"Configuring the default Firebase app...");
       [FIRApp configure];
       NSLog(@"Configured the default Firebase app %@.", [FIRApp defaultApp].name);
     }
     [FIRMessaging messaging].delegate = self;
+
+    _userDefaults = [NSUserDefaults standardUserDefaults];
+    _remoteMessageQueue = [[NSMutableArray alloc] init];
+    _registrar = registrar;
+    _headlessRunner = [[FlutterEngine alloc] initWithName:@"firebase_messaging_background" project:nil allowHeadlessExecution:YES];
+    _backgroundCallbackChannel = [FlutterMethodChannel methodChannelWithName:@"plugins.flutter.io/firebase_messaging_background" binaryMessenger:[_headlessRunner binaryMessenger]];
   }
   return self;
 }
@@ -183,6 +205,30 @@ static NSObject<FlutterPluginRegistrar> *_registrar;
     NSNumber *value = call.arguments;
     [FIRMessaging messaging].autoInitEnabled = value.boolValue;
     result(nil);
+  } else if ([@"FcmDartService#initialized" isEqualToString:call.method]) {
+      // called when the Dart isolate and Firebase Messaging plugin has been initalized.
+      // any pending remote messages should be dispatched now.
+      @synchronized(self) {
+          backgroundIsolateInitialized = YES;
+          while ([_remoteMessageQueue count] > 0) {
+              NSDictionary* message = _remoteMessageQueue[0];
+              [_remoteMessageQueue removeObjectAtIndex:0];
+
+              [self handleBackgroundMessage: message];
+          }
+      }
+      result(nil);
+  } else if ([@"FcmDartService#start" isEqualToString:method]) {
+      // called when configuring the Firebase Messaging plugin.
+      // save the callback handles here so they can used later
+      // when a message is received in the background
+      NSDictionary *arguments = call.arguments;
+      long setupHandle = [arguments[@"setupHandle"] longValue];
+      long backgroundHandle = [arguments[@"backgroundHandle"] longValue];
+
+      [self _saveCallbackHandle:backgroundSetupCallbackHandle handle:setupHandle];
+      [self _saveCallbackHandle:backgroundMessageCallbackHandle handle:backgroundHandle];
+      result(nil);
   } else {
     result(FlutterMethodNotImplemented);
   }
@@ -239,8 +285,28 @@ static NSObject<FlutterPluginRegistrar> *_registrar;
 - (BOOL)application:(UIApplication *)application
     didReceiveRemoteNotification:(NSDictionary *)userInfo
           fetchCompletionHandler:(void (^)(UIBackgroundFetchResult result))completionHandler {
-  [self didReceiveRemoteNotification:userInfo];
-  completionHandler(UIBackgroundFetchResultNoData);
+
+    int64_t backgroundMessageHandle = [self getCallbackHandle:backgroundMessageCallbackHandle];
+
+    // when a message is received, the application is in the background and it has a background message handle,
+    // queue the message to be handled, and start the background isolate if needed
+    if (application.applicationState == UIApplicationStateBackground && backgroundMessageHandle != nil) {
+        //save this handler for later so it can be completed
+        fetchCompletionHandler = completionHandler;
+
+        NSDictionary *args = @{
+                              @"handle" : @(backgroundMessageHandle),
+                              @"message" : userInfo,
+                            };
+        [self queueRemoteMessage:args];
+
+        if (!backgroundIsolateInitialized){
+            [self startBackgroundIsolate];
+        }
+    } else {
+        [self didReceiveRemoteNotification:userInfo];
+        completionHandler(UIBackgroundFetchResultNewData);
+    }
   return YES;
 }
 
@@ -277,5 +343,65 @@ static NSObject<FlutterPluginRegistrar> *_registrar;
     didReceiveMessage:(FIRMessagingRemoteMessage *)remoteMessage {
   [_channel invokeMethod:@"onMessage" arguments:remoteMessage.appData];
 }
+
+- (void) startBackgroundIsolate {
+    NSLog(@"Starting Firebase Messaging background isolate");
+
+    int64_t handle = [self getCallbackHandle:backgroundSetupCallbackHandle];
+
+    FlutterCallbackInformation *info = [FlutterCallbackCache lookupCallbackInformation:handle];
+    NSAssert(info != nil, @"failed to find callback");
+    NSString *entrypoint = info.callbackName;
+    NSString *uri = info.callbackLibraryPath;
+
+    [_headlessRunner runWithEntrypoint:entrypoint libraryURI:uri];
+    [_registrar addMethodCallDelegate:self channel:_backgroundCallbackChannel];
+
+    // Once our headless runner has been started, we need to register the application's plugins
+    // with the runner in order for them to work on the background isolate. `pluginRegistrantCallback` is
+    // a callback set from AppDelegate.m in the main application. This callback should register
+    // all relevant plugins (excluding those which require UI).
+
+    NSAssert(pluginRegistrantCallback != nil, @"failed to set pluginRegistrantCallback");
+    pluginRegistrantCallback(_headlessRunner);
+}
+
+// Get a callback handle that has been stored in NSUserDefaults
+- (int64_t) getCallbackHandle:(NSString *) key {
+    id handle = [_userDefaults objectForKey:key];
+    if (handle == nil) {
+        return 0;
+    }
+    return [handle longLongValue];
+}
+
+// Save a callback handle in NSUserDefaults
+- (void) _saveCallbackHandle:(NSString *)key handle:(int64_t)handle {
+    [_userDefaults setObject:[NSNumber numberWithLongLong:handle] forKey:key];
+}
+
+// Queues a remote message for handling
+// If the background isolate is not yet started, queues the message and starts the isolate
+// Otherwise the message is handled by the background isolate immediately
+- (void) queueRemoteMessage:(NSDictionary*)message {
+    @synchronized(self) {
+        if (backgroundIsolateInitialized) {
+            [self handleBackgroundMessage:message];
+        } else {
+            [_remoteMessageQueue addObject:message];
+        }
+    }
+}
+
+// dispatches a remote message to be handled by the dart background isolate
+- (void) handleBackgroundMessage:(NSDictionary*)arguments {
+    [_backgroundCallbackChannel invokeMethod:@"handleBackgroundMessage" arguments:arguments result:^(id  _Nullable result) {
+        if (fetchCompletionHandler!=nil) {
+            fetchCompletionHandler(UIBackgroundFetchResultNewData);
+            fetchCompletionHandler = nil;
+        }
+    }];
+}
+
 
 @end

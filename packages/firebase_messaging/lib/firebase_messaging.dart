@@ -37,9 +37,10 @@ void _fcmSetupBackgroundChannel(
       try {
         await handlerFunction(
             Map<String, dynamic>.from(call.arguments['message']));
-      } catch (e) {
+      } catch (e, StackTrace stack) {
         print('Unable to handle incoming background message.');
         print(e);
+        print(stack.toString());
       }
       return Future<void>.value();
     }
